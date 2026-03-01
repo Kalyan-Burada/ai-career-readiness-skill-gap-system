@@ -1,0 +1,47 @@
+🔹 Job Title: AI Product Manager
+
+We are looking for an experienced AI Product Manager to lead the development and optimization of AI-driven digital products. The ideal candidate should have strong experience in data analytics, product lifecycle management, and cross-functional team leadership.
+
+Responsibilities:
+
+Lead AI-powered product initiatives from ideation to deployment
+
+Work with engineering teams using Agile and Kanban methodologies
+
+Conduct A/B testing to improve user engagement and product performance
+
+Analyze customer feedback and product metrics using Power BI
+
+Collaborate with stakeholders to define product roadmap and strategy
+
+Optimize supply chain processes using data-driven insights
+
+Manage product backlog using tools such as Jira and Productboard
+
+Monitor KPIs including revenue growth, user acquisition, and retention
+
+Required Skills:
+
+Experience in Product Management
+
+Strong understanding of Artificial Intelligence concepts
+
+Experience with Microsoft Azure
+
+Knowledge of A/B Testing methodologies
+
+Experience with Power BI or similar analytics tools
+
+Familiarity with Agile frameworks and Kanban boards
+
+Experience using Jira or Productboard
+
+Strong analytical and problem-solving skills
+
+Preferred Qualifications:
+
+Bachelor’s degree in Computer Science or related field
+
+Experience in demand forecasting models
+
+Experience working with cross-functional product teams
