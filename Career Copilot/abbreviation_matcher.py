@@ -10,14 +10,16 @@ def is_abbreviation(text):
     - "CI/CD", "B2B", "A/B testing" → True
     - "machine learning", "python" → False
     """
-    # Remove common phrase words to get the core term
     words = text.lower().split()
-    
-    # Single uppercase word or letters
+
+    # Single-token abbreviation heuristics (generic, no domain keyword list)
     if len(words) == 1:
         word = words[0]
-        # 2-5 uppercase letters, possibly with slashes/dots
-        if re.match(r'^[a-z]{2,5}(/[a-z]{2,5})?$', word):
+        # Contains symbols/digits common in abbreviations (e.g., i2c, c/c++, ci/cd)
+        if re.search(r'[0-9/+.-]', word):
+            return True
+        # Very short alphabetic tokens can be abbreviations (ai, ml, kpi, usb)
+        if re.match(r'^[a-z]{2,3}$', word):
             return True
     
     # Check for patterns like "a/b testing" (keep the a/b part)
@@ -71,11 +73,18 @@ def matches_initials(abbr_phrase, full_phrase):
     - ("roi", "return on investment") → True
     - ("ml", "machine learning") → True
     """
-    # Quick check: if one phrase contains the other (handles "a/b testing" vs "a/b testing methodologies")
+    # Exact or token-boundary phrase check (prevents substring false positives,
+    # e.g., "uart" incorrectly matching "quarter").
     abbr_lower = abbr_phrase.lower().strip()
     full_lower = full_phrase.lower().strip()
-    
-    if abbr_lower in full_lower or full_lower in abbr_lower:
+
+    if abbr_lower == full_lower:
+        return True
+
+    if re.search(rf'(^|\s){re.escape(abbr_lower)}(\s|$)', full_lower):
+        return True
+
+    if re.search(rf'(^|\s){re.escape(full_lower)}(\s|$)', abbr_lower):
         return True
     
     # Extract the abbreviation part (remove trailing words like "testing", "management")
@@ -91,10 +100,6 @@ def matches_initials(abbr_phrase, full_phrase):
             
             # Direct match
             if clean_abbr == full_initials:
-                return True
-            
-            # Check if abbreviation is a subset of initials (for compound terms)
-            if clean_abbr in full_initials or full_initials in clean_abbr:
                 return True
     
     return False

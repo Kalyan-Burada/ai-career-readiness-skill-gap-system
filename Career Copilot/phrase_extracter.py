@@ -1,12 +1,13 @@
 import re
 import spacy
 from nltk.corpus import stopwords
+import string
 
 nlp = spacy.load("en_core_web_sm")
 stop_words = set(stopwords.words("english"))
 
 # Entity labels that correspond to skills / tools / technologies / orgs.
-# This is NOT a skill list — it's NER-category filtering (pure NLP).
+# This is NOT a skill list – it's NER-category filtering (pure NLP).
 _SKILL_ENT_LABELS = {
     'ORG', 'PRODUCT', 'GPE', 'WORK_OF_ART', 'LAW',
     'NORP', 'FAC', 'EVENT',
@@ -34,14 +35,40 @@ def extract_candidate_phrases(text_list):
     Input text should preserve original casing so that spaCy can
     detect proper nouns and named entities accurately.
 
-    ➜ No predefined skill dictionaries — purely NLP-driven.
+    → No predefined skill dictionaries – purely NLP-driven.
     """
     phrases = set()
 
     for sentence in text_list:
+        # Handle standalone technical terms (e.g., "I2C", "SPI", "UART")
+        # These often appear as isolated sentences from bullet lists in resumes
+        sentence_stripped = sentence.strip()
+        words = sentence_stripped.split()
+        
+        # If sentence is 1-3 words, check for STRONG technical markers and add directly.
+        # "Strong" means: digit (CSS3, HTML5), special char (C++, .NET), mixed-case
+        # interior caps (JavaScript, TypeScript, SolidWorks), or all-caps acronym
+        # (GPIO, UART, USB). Pure Initial-Cap-only words ("Reczee", "React") are NOT
+        # added here — their lowercase form goes through normal spaCy processing below,
+        # and real framework names appear in context sentences where NER/noun chunks work.
+        if 1 <= len(words) <= 3:
+            normalized_sentence = _normalize(sentence_stripped)
+            if normalized_sentence and len(normalized_sentence) >= 2:
+                has_digit     = any(c.isdigit() for c in sentence_stripped)
+                has_special   = any(c in ['+', '#', '/'] for c in sentence_stripped)
+                # Interior uppercase = mixed-case technical name (JavaScript, SolidWorks)
+                # Ignore the very first character — Initial Cap alone is not a signal.
+                has_interior_upper = any(c.isupper() for c in sentence_stripped[1:])
+                all_caps_short = (sentence_stripped.isupper()
+                                  and 2 <= len(sentence_stripped.replace(' ', '')) <= 6)
+
+                if has_digit or has_special or has_interior_upper or all_caps_short:
+                    if _is_valid_phrase(normalized_sentence):
+                        phrases.add(normalized_sentence)
+        
         doc = nlp(sentence)
 
-        # ── 1. Named entities (tool names, companies, tech) ──────────
+        # ── 1. Named entities (tool names, companies, tech) ──────
         for ent in doc.ents:
             if ent.label_ not in _SKILL_ENT_LABELS:
                 continue
@@ -49,7 +76,7 @@ def extract_candidate_phrases(text_list):
             if _is_valid_phrase(phrase):
                 phrases.add(phrase)
 
-        # ── 2. Verb-object pairs for JD responsibility bullet points ─
+        # ── 2. Verb-object pairs for JD responsibility bullet points ──
         #    e.g. "Monitor KPIs including revenue growth" → "kpis"
         #    e.g. "Optimize supply chain processes" → "supply chain processes"
         for token in doc:
@@ -71,7 +98,16 @@ def extract_candidate_phrases(text_list):
                                         if _is_valid_phrase(phrase):
                                             phrases.add(phrase)
 
-        # ── 3. Noun chunks with dependency-based filtering ───────────
+        # ── 3. Noun chunks with dependency-based filtering ───────
+        # Skip for single-token documents: the 1-3 word direct check at the
+        # top of this loop already handled them correctly and applies the
+        # technical-word heuristic WITHOUT the PROPN bypass.  Running noun
+        # chunks on a 1-token doc would wrongly rescue standalone brand names
+        # like "LinkedIn" or "BetterTeam" via the PROPN tag path in
+        # _is_valid_phrase, even though the direct check correctly rejected them.
+        if len(doc) <= 1:
+            continue
+
         for chunk in doc.noun_chunks:
             root = chunk.root
 
@@ -85,14 +121,20 @@ def extract_candidate_phrases(text_list):
                    for ch in root.children):
                 continue
 
-            # Skip conjuncts of frame nouns ("… and optimization of …")
+            # Skip conjuncts of frame nouns ("… and optimization of …",
+            # "… and understanding of …").  A conjunct whose HEAD also has
+            # a in/of/with prep child inherits the frame-noun nature.
             if root.dep_ == 'conj':
                 head = root.head
                 if any(ch.dep_ == 'prep' and ch.text.lower() in _FRAME_PREPS
                        for ch in head.children):
                     continue
+                # Also skip if the conjunct itself has of/in/with prep children
+                if any(ch.dep_ == 'prep' and ch.text.lower() in _FRAME_PREPS
+                       for ch in root.children):
+                    continue
 
-            # ── Build cleaned token list ─────────────────────────────
+            # ── Build cleaned token list ─────────────────────
             tokens = list(chunk)
 
             # Strip leading DET / PRON (but protect "A/B" style compounds)
@@ -110,13 +152,58 @@ def extract_candidate_phrases(text_list):
             phrase = _normalize(' '.join(t.text for t in tokens))
             pos_tags = [t.pos_ for t in tokens]
 
+            # If this chunk is a comma-separated list (e.g. "React js, Angular")
+            # extract each member individually so each keeps its own POS context.
+            # This preserves PROPN tags for tool names that would otherwise be
+            # lost when the split happens in step 5 without pos_tags.
+            comma_positions = [i for i, t in enumerate(tokens) if t.text == ',']
+            if comma_positions:
+                seg_start = 0
+                for cp in comma_positions:
+                    seg = [t for t in tokens[seg_start:cp] if t.pos_ != 'PUNCT']
+                    if seg:
+                        seg_phrase   = _normalize(' '.join(t.text for t in seg))
+                        seg_pos_tags = [t.pos_ for t in seg]
+                        if _is_valid_phrase(seg_phrase, seg_pos_tags):
+                            phrases.add(seg_phrase)
+                    seg_start = cp + 1
+                # last segment after final comma
+                seg = [t for t in tokens[seg_start:] if t.pos_ != 'PUNCT']
+                if seg:
+                    seg_phrase   = _normalize(' '.join(t.text for t in seg))
+                    seg_pos_tags = [t.pos_ for t in seg]
+                    if _is_valid_phrase(seg_phrase, seg_pos_tags):
+                        phrases.add(seg_phrase)
+                continue   # handled via segments; skip full-phrase add below
+
             if _is_valid_phrase(phrase, pos_tags):
                 phrases.add(phrase)
 
     # 4. Deduplicate (remove subsets of longer phrases)
     phrases = _deduplicate(phrases)
 
-    return sorted(phrases)
+    # 5. Split comma-separated lists AND handle "and"-separated terms.
+    # "UART, I2C, SPI, CAN, and USB" → ["uart", "i2c", "spi", "can", "usb"]
+    # "i2c and can bus communication"  → ["i2c", "can bus communication"]
+    # IMPORTANT: re-validate every part after splitting — without pos_tags context
+    # a split fragment like "clean" or "maintainable" (from "clean, maintainable,
+    # and reusable code") must still pass _is_valid_phrase; adjectives and generic
+    # words that only survived because of their longer phrase are caught here.
+    expanded = set()
+    for phrase in phrases:
+        phrase_for_split = phrase
+        phrase_for_split = phrase_for_split.replace(', and ', ',')
+        phrase_for_split = phrase_for_split.replace(' and ', ',')
+
+        if ',' in phrase_for_split:
+            parts = [p.strip() for p in phrase_for_split.split(',') if p.strip()]
+            for part in parts:
+                if _is_valid_phrase(part):   # re-validate without pos_tags
+                    expanded.add(part)
+        else:
+            expanded.add(phrase)
+
+    return sorted(expanded)
 
 #  Helpers
 def _expand_noun(token, doc):
@@ -144,380 +231,179 @@ def _normalize(text):
     return re.sub(r'\s+', ' ', text)
 
 
+def _is_technical_word(word):
+    """
+    Semantic heuristic: Check if single word is likely technical or generic.
+    NO hardcoded keyword lists — uses morphological and letter-pattern signals only.
+
+    Rules applied in order (first matching rule wins):
+      1. Multi-word phrase         → always accept (handled upstream).
+      2. Contains digit/special/
+         mixed-case/all-caps ≤5   → technical indicator, accept.
+      3. Ends in -ing (gerund)     → process/activity word (welding, machining,
+                                     programming); accept and rely on spaCy POS
+                                     tagging in _is_valid_phrase to block adjective
+                                     uses (e.g. "outstanding" tagged ADJ is rejected).
+      4. Ends in abstract-quality
+         noun suffix               → generic state/quality noun, reject.
+         (-ness, -ity, -ment,
+          -ance, -ence, -ency,
+          -ancy, -ety)
+      5. High common-letter ratio  → likely everyday English word, reject.
+    """
+    if ' ' in word:
+        return True
+
+    word_lower = word.lower()
+
+    # ── Strong technical signals ──────────────────────────────────────────
+    has_digit     = any(c.isdigit() for c in word)
+    has_special   = any(c in ['+', '#', '/', '-'] for c in word)
+    is_mixed_case = any(c.isupper() for c in word) and any(c.islower() for c in word)
+    all_caps_short = word.isupper() and len(word) <= 5   # GPIO, UART, I2C …
+
+    if has_digit or has_special or is_mixed_case or all_caps_short:
+        return True
+
+    all_lowercase = word_lower == word
+
+    if all_lowercase and 3 < len(word) < 16:
+
+        # ── Gerund / process words (welding, machining, programming) ─────
+        # These are valid technical skills as standalone nouns.
+        # spaCy POS filter in _is_valid_phrase blocks adjective/verb usages.
+        # Exception: very long -ing words (>=11 chars) whose stem is a
+        # common everyday verb (high common-letter ratio) are cognitive /
+        # communication verbs, not domain skills.
+        # e.g. "understanding" (13) stem "understand" ratio 1.0 → generic.
+        # e.g. "programming" (11) stem "programm" ratio 0.5 → technical.
+        if word_lower.endswith('ing'):
+            if len(word_lower) >= 11:
+                stem = word_lower[:-3]   # strip 'ing'
+                common_chars_set = set('aeiourstndlh')
+                stem_ratio = sum(1 for c in stem if c in common_chars_set) / len(stem)
+                if stem_ratio > 0.7:
+                    return False   # generic cognitive / communication gerund
+            return True
+
+        # ── Abstract quality / state / adjective suffixes ─────────────────
+        # Words ending here are almost never standalone skills;
+        # they describe qualities / states / actions rather than concrete
+        # artefacts or techniques.
+        # Multi-word phrases that *contain* these words (e.g.
+        # "process management", "circuit tolerance") are unaffected because
+        # _is_technical_word is only called for single-word candidates.
+        _abstract_suffixes = (
+            # ---- abstract state / quality nouns ----
+            'ness',   # weakness, effectiveness, awareness
+            'ity',    # creativity, agility, productivity, ability
+            'ment',   # management, improvement, assessment
+            'ance',   # performance, compliance, tolerance
+            'ence',   # experience, competence, excellence
+            'ency',   # efficiency, proficiency, latency
+            'ancy',   # consultancy, redundancy
+            'ety',    # safety, variety, anxiety
+            # ---- action / process abstract nouns ----
+            'tion',   # communication, motivation, collaboration, coordination
+            'sion',   # passion, mission, decision, revision
+            # ---- quality / capability adjective suffixes ----
+            'tive',   # proactive, reactive, innovative, collaborative, effective
+            'sive',   # aggressive, progressive, comprehensive
+            # ---- capability / describability adjectives ----
+            'ible',   # flexible, responsible, accessible, compatible
+            'able',   # manageable, scalable, maintainable, adaptable
+            # ---- past-participle generic action words ----
+            'ized',   # organized, optimized, digitized, standardized
+            'ised',   # organised, optimised (British spelling)
+        )
+        if word_lower.endswith(_abstract_suffixes):
+            return False
+
+        # ── Rare-letter signal: x, z, q, j are uncommon in everyday English ─
+        # Words containing them tend to be technical / borrowed terms
+        # (linux, unix, ajax, jquery, quartz, fuzzing).
+        if any(c in 'xzqj' for c in word_lower):
+            return True
+
+        # ── High common-letter ratio → generic everyday English ──────────
+        common_chars  = 'aeiourstndlh'
+        common_ratio  = sum(1 for c in word_lower if c in common_chars) / len(word_lower)
+        if common_ratio > 0.7:
+            return False
+
+    return True
+
+
 # Past-participle words that are only meaningful as the suffix of a
 # hyphenated compound adjective (e.g. "ai-DRIVEN", "data-DRIVEN",
 # "cloud-BASED", "ai-POWERED").  A phrase starting with one of these
-# alone is a broken fragment — reject it.
+# alone is a broken fragment – reject it.
 _COMPOUND_SUFFIX_FRAGMENTS = {
     'driven', 'powered', 'based', 'focused', 'enabled', 'oriented',
     'led', 'first', 'facing', 'ready', 'aware',
 }
 
-# Generic adjective/descriptive phrases that are NOT real skills.
-# These get extracted by NLP but are meaningless as skill gaps.
-_NON_SKILL_PHRASES = {
-    # Quality / adjective phrases
-    'high-quality', 'high quality', 'low-quality', 'low quality',
-    'seamless functionality', 'seamless experience', 'seamless integration',
-    'reusable code', 'clean code', 'scalable code', 'maintainable code',
-    'readable code', 'modular code', 'efficient code', 'production-ready code',
-    'technical feasibility', 'technical excellence', 'technical debt',
-    'pixel-perfect', 'pixel perfect', 'cross-browser compatibility',
-
-    # Employment / logistics terms
-    'full-time', 'full time', 'part-time', 'part time', 'remote',
-    'hybrid', 'on-site', 'contract', 'permanent', 'temporary',
-    'competitive salary', 'benefits package', 'equal opportunity',
-
-    # Task / deliverable descriptions (NOT skills)
-    'new user-facing features', 'user-facing features',
-    'new features', 'key features', 'core features',
-    'mobile and desktop devices', 'mobile devices', 'desktop devices',
-    'multiple platforms', 'various platforms',
-    'translate ui/ux design wireframes', 'design wireframes',
-    'translate designs', 'implement designs',
-    'technical specifications', 'functional requirements',
-    'code reviews', 'code review', 'peer reviews',
-    'bug fixes', 'bug fixing', 'troubleshooting issues',
-    'cross-browser testing', 'manual testing',
-    'documentation updates', 'technical documentation',
-
-    # Generic JD filler phrases
-    'ideal candidate', 'strong experience', 'good understanding',
-    'strong understanding', 'deep understanding', 'solid understanding',
-    'related field', 'digital products', 'web applications',
-    'similar tools', 'similar analytics tools', 'real-world constraints',
-    'various stakeholders', 'key stakeholders', 'team members',
-    'junior team members', 'senior team members',
-    'best practices', 'industry standards', 'business requirements',
-    'technical requirements', 'user engagement', 'user experience',
-    'customer feedback', 'performance metrics', 'product metrics',
-    'business metrics', 'revenue growth', 'user acquisition',
-    'strong analytical', 'preferred qualifications', 'required skills',
-    'responsibilities', 'qualifications', 'nice to have',
-    'years experience', 'years of experience', 'work experience',
-    'bachelor degree', "bachelor's degree", 'master degree', "master's degree",
-    'bachelor s', 'bachelors', 'masters', 'bachelor', 'master',
-    'bachelor s degree', 'master s degree', 'bachelor of science', 'master of science',
-    'phd', 'doctorate', 'associate degree', 'mba',
-    'computer science', 'related fields', 'equivalent experience',
-    'to present insights', 'present insights', 'to present',
-    'to stakeholders', 'to management', 'to leadership',
-    'to drive', 'to ensure', 'to support', 'to deliver',
-    'to build', 'to create', 'to develop', 'to implement',
-    'to maintain', 'to manage', 'to lead', 'to work',
-    'fast-paced environment', 'dynamic environment', 'team player',
-    'excellent communication', 'communication skills',
-    'written and verbal', 'attention to detail', 'detail oriented',
-    'self-motivated', 'proactive', 'collaborative environment',
-    'proven track record', 'track record', 'strong portfolio',
-    'modern web', 'large-scale applications', 'large scale applications',
-    'complex applications', 'enterprise applications',
-    'startup environment', 'agile environment', 'fast-paced team',
-    'product requirements', 'business logic', 'end users',
-    'senior developers', 'junior developers', 'other developers',
-    'engineering teams', 'development team', 'product team',
-    'design team', 'cross-functional teams',
-
-    # JD section headers and structure
-    'job summary', 'job description', 'job overview', 'job posting',
-    'job details', 'position summary', 'position overview',
-    'role summary', 'role overview', 'about the role', 'about us',
-    'who we are', 'what we offer', 'what you will do',
-    'key responsibilities', 'core responsibilities', 'main responsibilities',
-    'primary responsibilities', 'your responsibilities',
-    'minimum qualifications', 'preferred qualifications', 'required qualifications',
-    'about the company', 'about this role', 'the opportunity',
-    'what you bring', 'what we look for', 'your impact',
-
-    # Job platform references
-    'indeed jobs', 'indeed', 'glassdoor', 'linkedin jobs',
-    'job board', 'job boards', 'career page', 'apply now',
-    'remote work options', 'work options', 'flexible work',
-    'work arrangements', 'work from home',
-
-    # Generic problem / context descriptions
-    'real-world problems', 'real world problems',
-    'complex real-world problems', 'complex, real-world problems',
-    'diverse sources', 'diverse data sources', 'various sources',
-    'production systems', 'production environment', 'production environments',
-    'product features', 'key features', 'product roadmap features',
-    'related quantitative field', 'quantitative field',
-    'relevant field', 'similar field', 'related discipline',
-    'day-to-day operations', 'day to day operations',
-    'daily operations', 'business operations',
-    'actionable insights', 'data-driven insights', 'data driven insights',
-    'meaningful insights', 'valuable insights',
-    'cross-functional collaboration', 'cross functional collaboration',
-    'continuous improvement', 'process improvement',
-    'competitive advantage', 'strategic decisions', 'informed decisions',
-
-    # ── Business / Sales / Hospitality non-skill phrases ──
-    # Job titles & role descriptions
-    'business travel sales manager', 'sales manager', 'account manager',
-    'regional sales manager', 'area sales manager', 'national sales manager',
-    'hotel general manager', 'front desk manager', 'revenue manager',
-    'inside sales representative', 'sales representative', 'sales associate',
-    'account executive', 'business development manager',
-    'business development representative',
-
-    # Business entity types (not skills)
-    'existing high-value corporate clients', 'high-value corporate clients',
-    'corporate clients', 'corporate accounts', 'existing corporate accounts',
-    'new and existing corporate accounts', 'existing accounts',
-    'new corporate accounts', 'key accounts', 'strategic accounts',
-    'travel management companies tmcs', 'travel management companies',
-    'tmcs', 'travel agencies', 'corporate agencies',
-    'new b2b business', 'b2b business', 'b2b clients',
-    'new business', 'existing business', 'new clients',
-
-    # Business activities / deliverables (not skills)
-    'action plans', 'sales blitzes', 'sales plans',
-    'annual rates', 'negotiated rates', 'corporate rates',
-    'negotiated corporate rates', 'commercial terms', 'contract terms',
-    'corporate room nights', 'room nights', 'room revenue',
-    'monthly/quarterly revenue goals', 'revenue goals', 'sales goals',
-    'quarterly revenue goals', 'monthly revenue goals', 'sales targets',
-    'weekly/monthly sales reports', 'sales reports', 'monthly sales reports',
-    'weekly sales reports', 'quarterly reports', 'weekly reports',
-    'property site inspections', 'site inspections', 'property tours',
-    'industry events', 'networking events', 'trade shows',
-    'sales efforts', 'marketing efforts', 'outreach efforts',
-    'client relations', 'client relationships', 'customer relationships',
-    'account acquisition', 'account retention',
-    'competitor activity', 'competitive analysis',
-
-    # Generic business/sales terms that are activities not skills
-    'sales strategy', 'business strategy', 'go-to-market strategy',
-    'market analysis', 'market trends', 'market research',
-    'monthly targets', 'quarterly targets', 'annual targets',
-    'revenue growth', 'sales growth', 'business growth',
-    'client acquisition', 'lead generation', 'pipeline management',
-    'contract negotiation', 'rate negotiation',
-    'booking process', 'booking errors', 'travel booking',
-    'reimbursement turnaround', 'travel expenses',
-    'product knowledge', 'brand awareness',
-    'customer engagement', 'customer satisfaction',
-    'on-time deliveries', 'on time deliveries',
-    'file retrieval times', 'average delivery times',
-    'customer wait times', 'wait times',
-
-    # Experience/requirement descriptors (not skills)
-    'years of experience', '3-5 years', '5+ years', '3+ years',
-    'years experience', 'proven experience', 'strong experience',
-    'specifically targeting', 'strong proficiency',
-    'excellent negotiation', 'excellent communication',
-    'networking skills', 'negotiation skills',
-    'excellent negotiation and networking skills',
-    'excellent negotiation and networking',
-}
-
-# Adjective words that when they are the ONLY non-stop content in a phrase
-# make it a quality descriptor, not a skill (e.g. "reusable code", "seamless functionality")
-_QUALITY_ADJECTIVES = {
-    'reusable', 'seamless', 'scalable', 'maintainable', 'clean',
-    'robust', 'efficient', 'reliable', 'secure', 'responsive',
-    'interactive', 'intuitive', 'elegant', 'modular', 'flexible',
-    'readable', 'testable', 'extensible', 'performant', 'optimized',
-    'high-quality', 'production-ready', 'pixel-perfect',
-    'new', 'existing', 'modern', 'current', 'latest', 'various',
-    'multiple', 'complex', 'simple', 'basic', 'advanced',
-    'full-time', 'part-time', 'remote', 'hybrid',
-    # Additional context/modifier adjectives that are NOT technical qualifiers
-    'diverse', 'key', 'main', 'primary', 'core', 'overall',
-    'general', 'specific', 'particular', 'related', 'relevant',
-    'similar', 'real-world', 'cross-functional', 'day-to-day',
-    'actionable', 'meaningful', 'valuable', 'strategic',
-    'competitive', 'continuous', 'informed', 'production',
-    # Business/sales descriptors
-    'annual', 'monthly', 'weekly', 'quarterly', 'daily',
-    'corporate', 'commercial', 'negotiated', 'high-value',
-    'existing', 'potential', 'prospective', 'targeted',
-    'excellent', 'strong', 'proven', 'effective',
-}
-
-# Generic object nouns that are NOT skills by themselves
-# (e.g. "code", "features", "functionality" — vague without qualifier)
-_GENERIC_OBJECT_NOUNS = {
-    'code', 'features', 'functionality', 'components', 'applications',
-    'solutions', 'interfaces', 'systems', 'services', 'modules',
-    'products', 'platforms', 'tools', 'technologies', 'frameworks',
-    'websites', 'pages', 'elements', 'layouts', 'designs',
-    'wireframes', 'mockups', 'prototypes', 'specifications',
-    'feasibility', 'requirements', 'deliverables', 'milestones',
-    'objectives', 'goals', 'outcomes', 'updates', 'issues',
-    # Additional generic nouns that are NOT skills by themselves
-    'problems', 'sources', 'options', 'field', 'fields',
-    'summary', 'responsibilities', 'environment', 'environments',
-    'constraints', 'insights', 'operations', 'decisions',
-    'advantage', 'improvement', 'collaboration', 'arrangements',
-    'jobs', 'work', 'discipline',
-    # Business / sales generic nouns (NOT skills)
-    'rates', 'terms', 'contracts', 'agreements', 'proposals',
-    'reports', 'targets', 'revenue', 'budget', 'accounts',
-    'clients', 'customers', 'prospects', 'leads', 'agencies',
-    'events', 'meetings', 'inspections', 'tours',
-    'nights', 'bookings', 'reservations', 'relationships',
-    'efforts', 'activities', 'initiatives', 'strategies',
-    'trends', 'analysis', 'research', 'plans',
-    'blitzes', 'campaigns', 'presentations', 'pitches',
-}
-
-# Generic single words that spaCy may tag as PROPN but are not skills
-_NON_SKILL_SINGLE_WORDS = {
-    'experience', 'knowledge', 'understanding', 'familiarity',
-    'ability', 'skill', 'skills', 'expertise', 'proficiency',
-    'requirements', 'responsibilities', 'qualifications',
-    'bachelor', 'bachelors', 'master', 'masters', 'phd', 'doctorate', 'mba',
-    'present', 'insights', 'stakeholders', 'leadership',
-    'team', 'teams', 'role', 'roles', 'candidate', 'company',
-    'environment', 'organization', 'department', 'industry',
-    'customers', 'clients', 'users', 'stakeholders', 'partners',
-    'growth', 'improvement', 'development', 'management',
-    'strategy', 'performance', 'quality', 'impact', 'success',
-    'opportunities', 'challenges', 'solutions', 'results',
-    'process', 'processes', 'standards', 'practices',
-    'code', 'features', 'functionality', 'feasibility',
-    'components', 'applications', 'platforms', 'tools',
-    'interfaces', 'designs', 'wireframes', 'updates',
-    'documentation', 'deployment', 'implementation',
-    # Additional non-skill single words
-    'jobs', 'job', 'summary', 'field', 'fields', 'options',
-    'problems', 'sources', 'devices', 'mathematics',
-    'indeed', 'key', 'production', 'diverse', 'operations',
-    'insights', 'decisions', 'collaboration', 'arrangements',
-    'discipline', 'constraints', 'advantage', 'work',
-    # Business / sales single words that are NOT skills
-    'rates', 'terms', 'contracts', 'revenue', 'budget',
-    'accounts', 'clients', 'customers', 'prospects', 'leads',
-    'agencies', 'events', 'meetings', 'inspections', 'tours',
-    'nights', 'bookings', 'reservations', 'efforts', 'activities',
-    'trends', 'analysis', 'research', 'plans', 'blitzes',
-    'campaigns', 'pitches', 'targets', 'relationships',
-    'networking', 'retention', 'acquisition', 'negotiation',
-    'hospitality', 'marketing', 'sales',
-}
-
 
 def _is_valid_phrase(phrase, pos_tags=None):
     """
-    Accept meaningful skill / domain terms; reject noise.
-    Uses POS tags from spaCy — no hardcoded skill dictionaries.
-    Also filters out generic non-skill descriptive phrases,
-    quality attributes, and task descriptions.
+    Accept meaningful skill / domain terms; reject only obvious garbage.
+    Uses semantic patterns to detect generic nouns - NO hardcoded keywords.
     """
     if not phrase or len(phrase) < 2:
         return False
 
     words = phrase.split()
 
-    # Reject known non-skill phrases (exact match)
-    if phrase in _NON_SKILL_PHRASES:
-        return False
-
-    # Also check with commas stripped (e.g. "complex, real-world problems")
-    phrase_no_commas = phrase.replace(',', '').strip()
-    phrase_no_commas = re.sub(r'\s+', ' ', phrase_no_commas)
-    if phrase_no_commas in _NON_SKILL_PHRASES:
-        return False
-
-    # Reject phrases containing commas — usually lists or descriptions, not skills
-    # Exception: known tech patterns like "tableau, power bi" with recognized terms
-    if ',' in phrase:
-        # Check if it looks like a tool/tech list (both parts look technical)
-        parts = [p.strip() for p in phrase.split(',') if p.strip()]
-        # If any part is more than 3 words, it's a description, not a tool list
-        if any(len(p.split()) > 3 for p in parts):
-            return False
-        # If any part is a known non-skill, reject the whole thing
-        if any(p in _NON_SKILL_PHRASES or p in _NON_SKILL_SINGLE_WORDS for p in parts):
-            return False
-
-    # Reject education/degree terms
-    if re.match(r"^(bachelor|master|phd|doctorate|associate|mba)\b", phrase):
-        return False
-    
-    # Reject infinitive phrases ("to present insights", "to drive growth")
-    if phrase.startswith('to ') and len(words) >= 2:
-        return False
-
-    # Reject employment type terms as single "skills"
-    if phrase.replace('-', '') in {'fulltime', 'parttime', 'remote', 'hybrid', 'onsite', 'contract'}:
-        return False
-
-    # Phrase starts with a compound-adjective fragment word → reject
-    if words[0].rstrip(',') in _COMPOUND_SUFFIX_FRAGMENTS:
-        return False
-
     # Entirely stopwords → reject
     if all(w.rstrip(',') in stop_words for w in words):
         return False
 
-    # Single-word: strict gate for precision 
-    if len(words) == 1:
-        word = words[0].rstrip(',')
-        if word in stop_words or len(word) < 2:
-            return False
-        # Reject known non-skill single words
-        if word in _NON_SKILL_SINGLE_WORDS:
-            return False
-        # Reject quality adjectives as standalone
-        if word in _QUALITY_ADJECTIVES:
-            return False
-        # Reject generic object nouns as standalone
-        if word in _GENERIC_OBJECT_NOUNS:
-            return False
-        # Contains non-alpha chars → likely technical (a/b, kpi, etc.)
-        # But reject if it's just a hyphenated non-skill like "full-time"
-        if re.search(r'[^a-z]', word):
-            # Check if it's a hyphenated quality/employment term
-            parts = re.split(r'[-/]', word)
-            if all(p in _QUALITY_ADJECTIVES or p in _GENERIC_OBJECT_NOUNS
-                   or p in _NON_SKILL_SINGLE_WORDS or p in stop_words
-                   for p in parts if p):
-                return False
-            return True
-        # Proper noun (tool / technology name detected by spaCy)
-        if pos_tags and pos_tags[0] == 'PROPN':
-            return True
-        # Common-noun alone is too vague → reject for precision
+    # Reject compound suffix fragments at start
+    if words[0].rstrip(',') in _COMPOUND_SUFFIX_FRAGMENTS:
+        return False
+    
+    # Reject fragments with leading special chars
+    if words[0].startswith(('/', '-', 'the-')):
+        return False
+    
+    # Reject phone numbers and email patterns
+    digit_count = sum(1 for c in phrase if c.isdigit())
+    dash_count = phrase.count('-')
+    if digit_count >= 5 and dash_count >= 2:
+        return False
+    if 'professionalemail' in phrase.lower() or '@ ' in phrase or ' @' in phrase:
+        return False
+    
+    # Reject pure numeric or mostly numeric phrases
+    non_space = [c for c in phrase if c != ' ']
+    if non_space and sum(1 for c in non_space if c.isdigit()) / len(non_space) > 0.5:
+        return False
+    
+    # Reject year-based phrases (starts with 4-digit number)
+    if len(words) > 1 and words[0].isdigit() and len(words[0]) == 4:
         return False
 
-    # ── Multi-word validation ──
-    # Strip commas from words for matching
-    clean_words = [w.rstrip(',') for w in words]
-    non_stop = [w for w in clean_words if w not in stop_words]
-    if not non_stop:
+    # Reject username/personal info patterns
+    if 'username' in phrase.lower() or 'com/in' in phrase.lower():
+        return False
+    if phrase.count('/') > 1:
         return False
 
-    # If all meaningful words are in non-skill single words, reject
-    if all(w in _NON_SKILL_SINGLE_WORDS for w in non_stop):
-        return False
-
-    # Reject "quality-adjective + generic-noun" patterns
-    # e.g. "reusable code", "seamless functionality", "new features",
-    #       "diverse sources", "production systems", "key responsibilities"
-    content_words = [w for w in clean_words if w not in stop_words]
-    if len(content_words) >= 2:
-        adjectives_in_phrase = [w for w in content_words if w in _QUALITY_ADJECTIVES]
-        nouns_in_phrase = [w for w in content_words if w in _GENERIC_OBJECT_NOUNS]
-        # If every content word is either a quality adj or a generic noun → reject
-        if len(adjectives_in_phrase) + len(nouns_in_phrase) >= len(content_words):
-            return False
-
-    # Reject phrases where all content words are non-skill singles
-    if all(w in _NON_SKILL_SINGLE_WORDS or w in _QUALITY_ADJECTIVES
-           or w in _GENERIC_OBJECT_NOUNS for w in content_words):
-        return False
-
-    # Reject phrases that start with a verb (task descriptions like
-    # "translate ui/ux design wireframes", "implement new features")
-    if pos_tags and pos_tags[0] == 'VERB':
-        return False
-
-    # Must contain at least one NOUN or PROPN
+    # Must contain at least one noun or proper noun (semantic filter).
+    # Check this BEFORE the single-word heuristic so that spaCy's PROPN
+    # label (e.g. SolidWorks, Kubernetes, AutoCAD after lowercasing) can
+    # rescue proper-noun tool names from the letter-ratio filter.
     if pos_tags and not any(p in ('NOUN', 'PROPN') for p in pos_tags):
         return False
+
+    # Semantic check: reject generic (non-technical) single words.
+    # Skip this check when spaCy already identified the token as a proper
+    # noun — those are named entities / tool names, always keep them.
+    if len(words) == 1:
+        is_propn = pos_tags and pos_tags[0] == 'PROPN'
+        if not is_propn and not _is_technical_word(phrase):
+            return False
+
     return True
 
 
