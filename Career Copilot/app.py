@@ -17,7 +17,7 @@ raw_resume = extract_resume_text(RESUME_FILE)
 clean_resume_sentences = [
     clean_text(s)
     for s in split_into_sentences(raw_resume)
-    if len(s.strip()) > 3
+    if len(s.strip()) >= 3
 ]
 
 resume_skills = extract_candidate_phrases(clean_resume_sentences)
@@ -31,7 +31,7 @@ with open(JD_FILE, "r", encoding="utf-8") as f:
 clean_jd_sentences = [
     clean_text(s)
     for s in split_into_sentences(raw_jd)
-    if len(s.strip()) > 0
+    if len(s.strip()) >= 3
 ]
 
 jd_skills = extract_candidate_phrases(clean_jd_sentences)

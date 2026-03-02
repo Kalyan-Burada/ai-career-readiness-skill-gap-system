@@ -225,14 +225,17 @@ with tab1:
                             if advice.get('recommended_projects'):
                                 st.subheader("🚀 Recommended Projects")
                                 for project in advice['recommended_projects']:
-                                    with st.expander(f"📁 {project.get('name', 'Project')}"):
-                                        st.markdown(f"**📋 Description:** {project.get('description', 'N/A')}")
-                                        if project.get('intuition'):
-                                            st.markdown(f"**💡 Why This Project:** {project['intuition']}")
-                                        if project.get('tech_stack'):
-                                            st.markdown(f"**🛠️ Tech Stack:** {project['tech_stack']}")
-                                        if project.get('skills_covered'):
-                                            st.markdown("**🎯 Skills Covered:** " + ", ".join(project['skills_covered']))
+                                    if isinstance(project, str):
+                                        st.markdown(f"• {project}")
+                                    else:
+                                        with st.expander(f"📁 {project.get('name', 'Project')}"):
+                                            st.markdown(f"**📋 Description:** {project.get('description', 'N/A')}")
+                                            if project.get('intuition'):
+                                                st.markdown(f"**💡 Why This Project:** {project['intuition']}")
+                                            if project.get('tech_stack'):
+                                                st.markdown(f"**🛠️ Tech Stack:** {project['tech_stack']}")
+                                            if project.get('skills_covered'):
+                                                st.markdown("**🎯 Skills Covered:** " + ", ".join(project['skills_covered']))
                             
                             # Career Paths
                             if advice.get('career_paths'):
