@@ -38,3 +38,12 @@ output.txt
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Sample / test data files
+*.pdf
+*.pkl
+
+# Debug / temp text dumps
+debug_*.txt
+mech_jd.txt
+embedded_jd_test.txt
